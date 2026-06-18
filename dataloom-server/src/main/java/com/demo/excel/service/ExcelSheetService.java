@@ -11,20 +11,23 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.HashMap;
-import java.util.ArrayList;
-import java.util.LinkedHashMap;
+import java.util.Set;
 
 /**
  * Excel Sheet 及数据分块查询服务
  * <p>
  * 职责：
  * <ul>
- *   <li>查询文档下的所有 Sheet 元信息</li>
- *   <li>按 Sheet ID 加载全部或指定范围的数据分块</li>
- *   <li>删除文档时级联清理 Sheet 和 Chunk 数据</li>
+ * <li>查询文档下的所有 Sheet 元信息</li>
+ * <li>按 Sheet ID 加载全部或指定范围的数据分块</li>
+ * <li>删除文档时级联清理 Sheet 和 Chunk 数据</li>
  * </ul>
  */
 @Service
@@ -48,8 +51,8 @@ public class ExcelSheetService {
     public List<ExcelSheet> listSheetsByDocumentId(Long documentId) {
         QueryWrapper<ExcelSheet> qw = new QueryWrapper<>();
         qw.eq("document_id", documentId)
-          .eq("status", 1)
-          .orderByAsc("sheet_index");
+                .eq("status", 1)
+                .orderByAsc("sheet_index");
         return sheetMapper.selectList(qw);
     }
 
@@ -64,7 +67,7 @@ public class ExcelSheetService {
     public List<ExcelSheetChunk> listChunksBySheetId(Long sheetId) {
         QueryWrapper<ExcelSheetChunk> qw = new QueryWrapper<>();
         qw.eq("sheet_id", sheetId)
-          .orderByAsc("chunk_index");
+                .orderByAsc("chunk_index");
         return chunkMapper.selectList(qw);
     }
 
@@ -140,35 +143,54 @@ public class ExcelSheetService {
                         : new com.alibaba.fastjson.JSONArray();
             }
 
+            // 构建 "r_c" → 数组下标 的索引，将查找从 O(n) 降为 O(1)
+            Map<String, Integer> cellIndex = new HashMap<>(cellArray.size());
+            for (int i = 0; i < cellArray.size(); i++) {
+                com.alibaba.fastjson.JSONObject cell = cellArray.getJSONObject(i);
+                cellIndex.put(cell.getIntValue("r") + "_" + cell.getIntValue("c"), i);
+            }
+
+            // 待删除的下标集合，延迟到最后一并清理，避免每次删除都重建索引
+            Set<Integer> removeSet = new HashSet<>();
+
             for (Map<String, Object> update : entry.getValue()) {
                 int r = Integer.parseInt(update.get("r").toString());
                 int c = Integer.parseInt(update.get("c").toString());
+                String cellKey = r + "_" + c;
                 Object vObj = update.get("v");
                 com.alibaba.fastjson.JSONObject cellValue = null;
                 if (vObj != null) {
-                    cellValue = com.alibaba.fastjson.JSONObject.parseObject(com.alibaba.fastjson.JSONObject.toJSONString(vObj));
+                    cellValue = com.alibaba.fastjson.JSONObject
+                            .parseObject(com.alibaba.fastjson.JSONObject.toJSONString(vObj));
                 }
 
-                boolean found = false;
-                for (int i = 0; i < cellArray.size(); i++) {
-                    com.alibaba.fastjson.JSONObject cell = cellArray.getJSONObject(i);
-                    if (cell.getIntValue("r") == r && cell.getIntValue("c") == c) {
-                        if (cellValue == null || cellValue.isEmpty()) {
-                            cellArray.remove(i);
-                        } else {
-                            cell.put("v", cellValue);
-                        }
-                        found = true;
-                        break;
+                Integer idx = cellIndex.get(cellKey);
+                if (idx != null) {
+                    if (cellValue == null || cellValue.isEmpty()) {
+                        // 标记删除，不立即从数组移除（避免索引错位）
+                        removeSet.add(idx.intValue());
+                        cellIndex.remove(cellKey);
+                    } else {
+                        // 原地更新，不影响索引
+                        cellArray.getJSONObject(idx.intValue()).put("v", cellValue);
                     }
-                }
-
-                if (!found && cellValue != null && !cellValue.isEmpty()) {
+                } else if (cellValue != null && !cellValue.isEmpty()) {
+                    // 新增单元格，追加到末尾
                     com.alibaba.fastjson.JSONObject newCell = new com.alibaba.fastjson.JSONObject();
                     newCell.put("r", r);
                     newCell.put("c", c);
                     newCell.put("v", cellValue);
                     cellArray.add(newCell);
+                    cellIndex.put(cellKey, cellArray.size() - 1);
+                }
+            }
+
+            // 统一清理：倒序移除标记的单元格，倒序保证下标不会错位
+            if (!removeSet.isEmpty()) {
+                List<Integer> sortedIndices = new ArrayList<>(removeSet);
+                sortedIndices.sort(Collections.reverseOrder());
+                for (int idx : sortedIndices) {
+                    cellArray.remove(idx);
                 }
             }
 
