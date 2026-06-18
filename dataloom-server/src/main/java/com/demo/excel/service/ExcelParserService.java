@@ -18,17 +18,19 @@ import org.springframework.transaction.annotation.Transactional;
 import java.io.InputStream;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Excel 解析引擎 — 流式 POI 解析 + 分块持久化
  * <p>
  * 核心设计：
  * <ul>
- *   <li>使用 Apache POI {@link WorkbookFactory} 逐行读取，避免整体加载入内存</li>
- *   <li>按 {@code CHUNK_SIZE} 行为单位，将 celldata JSON 分块写入 excel_sheet_chunk 表</li>
- *   <li>合并单元格、列宽等小型配置存入 excel_sheet 表，不参与分块</li>
- *   <li>上层调用方无需关心分块细节，只传入 documentId 即可</li>
+ * <li>使用 Apache POI {@link WorkbookFactory} 逐行读取，避免整体加载入内存</li>
+ * <li>按 {@code CHUNK_SIZE} 行为单位，将 celldata JSON 分块写入 excel_sheet_chunk 表</li>
+ * <li>合并单元格、列宽等小型配置存入 excel_sheet 表，不参与分块</li>
+ * <li>上层调用方无需关心分块细节，只传入 documentId 即可</li>
  * </ul>
  *
  * @author demo
@@ -52,13 +54,13 @@ public class ExcelParserService {
      * <p>
      * 执行流程：
      * <ol>
-     *   <li>遍历所有 Sheet</li>
-     *   <li>每个 Sheet 插入一条 excel_sheet 记录（存元信息 + 配置）</li>
-     *   <li>按 CHUNK_SIZE 行批量构建 celldata JSON，逐块写入 excel_sheet_chunk</li>
+     * <li>遍历所有 Sheet</li>
+     * <li>每个 Sheet 插入一条 excel_sheet 记录（存元信息 + 配置）</li>
+     * <li>按 CHUNK_SIZE 行批量构建 celldata JSON，逐块写入 excel_sheet_chunk</li>
      * </ol>
      *
-     * @param is         Excel 文件输入流（.xlsx 或 .xls）
-     * @param document   已持久化的文档实体（需含有效 ID）
+     * @param is       Excel 文件输入流（.xlsx 或 .xls）
+     * @param document 已持久化的文档实体（需含有效 ID）
      * @return 所有 Sheet 的元信息列表（不含 celldata，仅用于给调用方汇总）
      */
     @Transactional(rollbackFor = Exception.class)
@@ -132,20 +134,26 @@ public class ExcelParserService {
 
     /**
      * 将一个 Sheet 的所有单元格数据按 CHUNK_SIZE 行分块，批量写入数据库
+     * <p>
+     * 分块策略：chunkIndex = rowIdx / CHUNK_SIZE，由行号直接决定块归属。
+     * 这样保证与 batchUpdateCells 中 r / CHUNK_SIZE 的定位逻辑完全一致，
+     * 即使存在空行也不会导致分块边界偏移。
      */
     private void saveSheetChunks(Sheet sheet, Workbook workbook, ExcelSheet sheetEntity) {
         FormulaEvaluator evaluator = workbook.getCreationHelper().createFormulaEvaluator();
         int lastRowNum = sheet.getLastRowNum();
 
-        // 当前块正在积累的 celldata 条目
-        List<JSONObject> buffer = new ArrayList<>(CHUNK_SIZE * 10);
-        int chunkIndex = 0;
-        int chunkStartRow = 0;
-        int chunkEndRow = 0;
+        // 按 chunkIndex 分组收集单元格数据
+        Map<Integer, List<JSONObject>> chunkBuffer = new LinkedHashMap<>();
 
         for (int rowIdx = 0; rowIdx <= lastRowNum; rowIdx++) {
             Row row = sheet.getRow(rowIdx);
-            if (row == null) continue;
+            if (row == null)
+                continue;
+
+            // chunkIndex 由行号直接决定，与 batchUpdateCells 的 r / CHUNK_SIZE 一致
+            int chunkIndex = rowIdx / CHUNK_SIZE;
+            List<JSONObject> buffer = chunkBuffer.computeIfAbsent(chunkIndex, k -> new ArrayList<>(CHUNK_SIZE * 10));
 
             for (Cell cell : row) {
                 JSONObject vObj = buildCellValue(cell, evaluator);
@@ -157,43 +165,38 @@ public class ExcelParserService {
                     buffer.add(cellItem);
                 }
             }
+        }
 
-            chunkEndRow = rowIdx;
+        // 逐块写入数据库
+        int chunkCount = 0;
+        for (Map.Entry<Integer, List<JSONObject>> entry : chunkBuffer.entrySet()) {
+            int chunkIndex = entry.getKey();
+            List<JSONObject> cells = entry.getValue();
+            if (cells.isEmpty())
+                continue;
 
-            // 达到分块大小时，将 buffer 写入数据库
-            boolean isChunkFull = (rowIdx - chunkStartRow + 1) >= CHUNK_SIZE;
-            boolean isLastRow   = (rowIdx == lastRowNum);
+            ExcelSheetChunk chunk = new ExcelSheetChunk();
+            chunk.setDocumentId(sheetEntity.getDocumentId());
+            chunk.setSheetId(sheetEntity.getId());
+            chunk.setChunkIndex(chunkIndex);
+            chunk.setRowStart(chunkIndex * CHUNK_SIZE);
+            chunk.setRowEnd((chunkIndex + 1) * CHUNK_SIZE - 1);
+            chunk.setCelldataJson(JSONArray.toJSONString(cells));
+            chunkMapper.insert(chunk);
 
-            if ((isChunkFull || isLastRow) && !buffer.isEmpty()) {
-                ExcelSheetChunk chunk = new ExcelSheetChunk();
-                chunk.setDocumentId(sheetEntity.getDocumentId());
-                chunk.setSheetId(sheetEntity.getId());
-                chunk.setChunkIndex(chunkIndex);
-                chunk.setRowStart(chunkStartRow);
-                chunk.setRowEnd(chunkEndRow);
-                chunk.setCelldataJson(JSONArray.toJSONString(buffer));
-                chunkMapper.insert(chunk);
-
-                log.debug("    Chunk[{}] 已写入: rows {}-{}, cellCount={}", chunkIndex, chunkStartRow, chunkEndRow, buffer.size());
-
-                // 重置缓冲区
-                buffer.clear();
-                chunkIndex++;
-                chunkStartRow = rowIdx + 1;
-            } else if (isChunkFull) {
-                // buffer 为空但行数达到阈值，只推进 chunkStartRow
-                chunkStartRow = rowIdx + 1;
-            }
+            log.debug("    Chunk[{}] 已写入: rows {}-{}, cellCount={}", chunkIndex, chunk.getRowStart(), chunk.getRowEnd(),
+                    cells.size());
+            chunkCount = chunkIndex + 1;
         }
 
         // 更新 chunkCount
         ExcelSheet update = new ExcelSheet();
         update.setId(sheetEntity.getId());
-        update.setChunkCount(chunkIndex);
+        update.setChunkCount(chunkCount);
         sheetMapper.updateById(update);
-        sheetEntity.setChunkCount(chunkIndex);
+        sheetEntity.setChunkCount(chunkCount);
 
-        log.info("    Sheet [{}] 分块完成，共 {} 块", sheetEntity.getSheetName(), chunkIndex);
+        log.info("    Sheet [{}] 分块完成，共 {} 块", sheetEntity.getSheetName(), chunkCount);
     }
 
     /**
@@ -207,7 +210,8 @@ public class ExcelParserService {
             switch (cell.getCellType()) {
                 case STRING: {
                     String val = cell.getStringCellValue();
-                    if (val == null || val.isEmpty()) return null;
+                    if (val == null || val.isEmpty())
+                        return null;
                     v.put("v", val);
                     v.put("m", val);
                     ct.put("fa", "General");
@@ -325,7 +329,8 @@ public class ExcelParserService {
     private JSONObject buildRowLen(Sheet sheet) {
         JSONObject rowHeights = new JSONObject();
         for (Row row : sheet) {
-            if (row == null) continue;
+            if (row == null)
+                continue;
             float height = row.getHeightInPoints();
             if (height > 0) {
                 rowHeights.put(String.valueOf(row.getRowNum()), Math.round(height / 0.75f));
@@ -335,7 +340,8 @@ public class ExcelParserService {
     }
 
     private String formatNum(double num) {
-        if (num == (long) num) return String.valueOf((long) num);
+        if (num == (long) num)
+            return String.valueOf((long) num);
         return String.valueOf(num);
     }
 }
