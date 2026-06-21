@@ -5,6 +5,18 @@
 - `dataloom-server`：Spring Boot 后端，端口 `9191`
 - `dataloom-web`：Vue 3 + Vite + Element Plus 前端，通过 Nginx 暴露端口 `8081`
 
+## 环境 Profile
+
+后端默认使用 `dev` Profile（H2）。本地非 Docker 启动时：
+
+```bash
+# 默认 dev，可省略
+export SPRING_PROFILES_ACTIVE=dev
+cd dataloom-server && mvn spring-boot:run
+```
+
+生产 MySQL Profile 将在 Wave 2 与 Compose 一并启用（`SPRING_PROFILES_ACTIVE=prod`）。
+
 ## 前置要求
 
 - Docker 24+
