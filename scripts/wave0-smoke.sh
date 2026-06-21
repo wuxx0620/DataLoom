@@ -14,6 +14,14 @@ check_endpoint() {
 
   if [[ "${code}" != "200" ]]; then
     echo "FAIL: ${label} (${path}) returned HTTP ${code}"
+    if [[ "${code}" == "000" ]]; then
+      echo
+      echo "HTTP 000 表示无法连接到 ${BASE_URL}，通常原因："
+      echo "  1. 后端未启动（请先运行: cd dataloom-server && mvn spring-boot:run）"
+      echo "  2. 端口不是 9191（可设置: BASE_URL=http://localhost:端口 bash scripts/wave0-smoke.sh）"
+      echo "  3. 防火墙或 Docker 网络隔离"
+      echo
+    fi
     cat /tmp/wave0-body.json 2>/dev/null || true
     exit 1
   fi

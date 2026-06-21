@@ -23,9 +23,22 @@ export SPRING_PROFILES_ACTIVE=dev   # 默认，可省略
 
 ## 自动化冒烟（API 层）
 
+**前置：后端必须先启动**，否则会出现 `HTTP 000`（连接失败）。
+
 ```bash
-# 仓库根目录
+# 终端 1：启动后端（默认 dev Profile，端口 9191）
+cd dataloom-server
+mvn spring-boot:run
+
+# 看到 Started ExcelServiceApplication 后，终端 2 执行：
+cd /path/to/DataLoom
 bash scripts/wave0-smoke.sh
+```
+
+可选：指定其他地址
+
+```bash
+BASE_URL=http://127.0.0.1:9191 bash scripts/wave0-smoke.sh
 ```
 
 通过标准：脚本 exit code = 0，输出 `Wave 0 smoke check passed`.
