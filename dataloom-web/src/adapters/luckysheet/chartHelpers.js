@@ -1,4 +1,5 @@
 import { defaultOption } from '@/utils/chartmixDefaultOption'
+import { resolveSheetCalcChain } from '@/adapters/luckysheet/formulaHelpers'
 
 /**
  * 补全 Luckysheet chartmix 所需的 chart 字段，避免插件初始化崩溃。
@@ -43,16 +44,20 @@ export function normalizeChartsForInit(charts = []) {
 }
 
 export function buildLuckysheetCreatePayload(sheets) {
-  return sheets.map((sheet, index) => ({
-    name: sheet.name || `Sheet${index + 1}`,
-    index: String(index),
-    status: sheet.status ?? (index === 0 ? 1 : 0),
-    order: index,
-    celldata: sheet.celldata || [],
-    config: sheet.config || { merge: {}, columnlen: {}, rowlen: {} },
-    hyperlink: sheet.hyperlink || {},
-    images: sheet.images || {},
-    luckysheet_conditionformat_save: sheet.luckysheet_conditionformat_save || [],
-    chart: normalizeChartsForInit(sheet.chart)
-  }))
+  return sheets.map((sheet, index) => {
+    const sheetIndex = sheet.index != null ? String(sheet.index) : String(index)
+    return {
+      name: sheet.name || `Sheet${index + 1}`,
+      index: sheetIndex,
+      status: sheet.status ?? (index === 0 ? 1 : 0),
+      order: index,
+      celldata: sheet.celldata || [],
+      calcChain: resolveSheetCalcChain(sheet, sheetIndex),
+      config: sheet.config || { merge: {}, columnlen: {}, rowlen: {} },
+      hyperlink: sheet.hyperlink || {},
+      images: sheet.images || {},
+      luckysheet_conditionformat_save: sheet.luckysheet_conditionformat_save || [],
+      chart: normalizeChartsForInit(sheet.chart)
+    }
+  })
 }

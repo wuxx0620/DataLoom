@@ -1,6 +1,11 @@
 import { SPREADSHEET_CONTAINER_ID } from '@/adapters/spreadsheet/types'
 import { stableJson } from '@/adapters/spreadsheet/stableJson'
 import { buildLuckysheetCreatePayload } from '@/adapters/luckysheet/chartHelpers'
+import {
+  collectFormulaCellUpdates,
+  ensureWorkbookCalcChains,
+  refreshLuckysheetFormulas
+} from '@/adapters/luckysheet/formulaHelpers'
 import { serializeLuckysheetWorkbook } from '@/adapters/luckysheet/serializeWorkbook'
 
 export class LuckysheetAdapter {
@@ -17,6 +22,8 @@ export class LuckysheetAdapter {
     this.structureSnapshot = null
     this.keydownHandler = null
     this.toolbarClickHandler = null
+    this.formulaRefreshTimer = null
+    this.recalculatingFormulas = false
   }
 
   get luckysheet() {
@@ -51,14 +58,26 @@ export class LuckysheetAdapter {
       pluginsUrl: window.location.origin,
       data: payload,
       hook: {
+        workbookCreateAfter: () => {
+          ensureWorkbookCalcChains(this.luckysheet)
+          this.refreshFormulas({ markDirty: false })
+        },
         updated: () => {
           this.onWorkbookDirty?.()
           this.markCurrentSelectionDirty()
         },
-        cellUpdated: (r, c, _oldValue, newValue) => this.markCellDirty(r, c, newValue),
+        cellUpdated: (r, c, _oldValue, newValue) => {
+          if (!this.recalculatingFormulas) {
+            this.markCellDirty(r, c, newValue)
+          }
+          this.scheduleFormulaRefresh()
+        },
         imageDeleteAfter: (imageItem) => this.handleImageDelete(imageItem)
       }
     })
+
+    ensureWorkbookCalcChains(this.luckysheet)
+    this.refreshFormulas({ markDirty: false })
 
     this.captureStructureSnapshot()
     this.bindDomHandlers()
@@ -66,6 +85,10 @@ export class LuckysheetAdapter {
 
   destroy() {
     this.unbindDomHandlers()
+    if (this.formulaRefreshTimer) {
+      clearTimeout(this.formulaRefreshTimer)
+      this.formulaRefreshTimer = null
+    }
 
     try {
       this.luckysheet?.destroy?.()
@@ -74,6 +97,31 @@ export class LuckysheetAdapter {
     }
 
     this.structureSnapshot = null
+  }
+
+  scheduleFormulaRefresh() {
+    if (this.formulaRefreshTimer) {
+      clearTimeout(this.formulaRefreshTimer)
+    }
+    this.formulaRefreshTimer = window.setTimeout(() => {
+      this.formulaRefreshTimer = null
+      this.refreshFormulas({ markDirty: true })
+    }, 30)
+  }
+
+  refreshFormulas({ markDirty = true } = {}) {
+    if (!this.luckysheet) return
+
+    ensureWorkbookCalcChains(this.luckysheet)
+    this.recalculatingFormulas = true
+
+    refreshLuckysheetFormulas(this.luckysheet, () => {
+      if (markDirty) {
+        collectFormulaCellUpdates(this.luckysheet, this.getSheetIdMap, this.onCellDirty)
+        this.onWorkbookDirty?.()
+      }
+      this.recalculatingFormulas = false
+    })
   }
 
   bindDomHandlers() {
