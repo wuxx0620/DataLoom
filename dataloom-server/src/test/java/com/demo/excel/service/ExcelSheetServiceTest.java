@@ -1,32 +1,35 @@
 package com.demo.excel.service;
 
-import com.alibaba.fastjson.JSONArray;
-import com.alibaba.fastjson.JSONObject;
 import com.baomidou.mybatisplus.core.conditions.Wrapper;
+import com.demo.excel.common.JsonHelper;
 import com.demo.excel.entity.ExcelSheet;
 import com.demo.excel.entity.ExcelSheetChunk;
 import com.demo.excel.mapper.ExcelSheetChunkMapper;
 import com.demo.excel.mapper.ExcelSheetMapper;
-import org.junit.Test;
-import org.junit.runner.RunWith;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
-import org.mockito.InjectMocks;
 import org.mockito.Mock;
-import org.mockito.junit.MockitoJUnitRunner;
+import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.test.util.ReflectionTestUtils;
 
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.verify;
 
-@RunWith(MockitoJUnitRunner.class)
-public class ExcelSheetServiceTest {
+@ExtendWith(MockitoExtension.class)
+class ExcelSheetServiceTest {
 
     @Mock
     private ExcelSheetMapper sheetMapper;
@@ -37,34 +40,44 @@ public class ExcelSheetServiceTest {
     @Mock
     private ExcelDocumentService documentService;
 
-    @InjectMocks
     private ExcelSheetService sheetService;
 
+    private final JsonHelper json = new JsonHelper(new ObjectMapper());
+
+    @BeforeEach
+    void setUp() {
+        sheetService = new ExcelSheetService();
+        ReflectionTestUtils.setField(sheetService, "sheetMapper", sheetMapper);
+        ReflectionTestUtils.setField(sheetService, "chunkMapper", chunkMapper);
+        ReflectionTestUtils.setField(sheetService, "documentService", documentService);
+        ReflectionTestUtils.setField(sheetService, "json", json);
+    }
+
     @Test
-    public void replaceWorkbookRebuildsSheetsChunksAndDocumentMetadata() {
-        JSONObject firstCell = new JSONObject();
+    void replaceWorkbookRebuildsSheetsChunksAndDocumentMetadata() {
+        ObjectNode firstCell = json.createObject();
         firstCell.put("v", "A1");
         firstCell.put("m", "A1");
 
-        JSONObject secondCell = new JSONObject();
+        ObjectNode secondCell = json.createObject();
         secondCell.put("v", 42);
         secondCell.put("m", "42");
 
-        JSONArray firstRow = new JSONArray();
+        ArrayNode firstRow = json.createArray();
         firstRow.add(firstCell);
 
-        JSONArray secondRow = new JSONArray();
-        secondRow.add(null);
+        ArrayNode secondRow = json.createArray();
+        secondRow.addNull();
         secondRow.add(secondCell);
 
-        JSONObject config = new JSONObject();
-        JSONObject columnLen = new JSONObject();
+        ObjectNode config = json.createObject();
+        ObjectNode columnLen = json.createObject();
         columnLen.put("0", 120);
-        config.put("columnlen", columnLen);
+        config.set("columnlen", columnLen);
 
-        JSONObject rowLen = new JSONObject();
+        ObjectNode rowLen = json.createObject();
         rowLen.put("0", 28);
-        config.put("rowlen", rowLen);
+        config.set("rowlen", rowLen);
 
         Map<String, Object> sheet = new java.util.LinkedHashMap<>();
         sheet.put("name", "Budget");
@@ -96,12 +109,12 @@ public class ExcelSheetServiceTest {
         assertEquals(Long.valueOf(7L), chunk.getDocumentId());
         assertNotNull(chunk.getCelldataJson());
 
-        JSONArray celldata = JSONArray.parseArray(chunk.getCelldataJson());
+        ArrayNode celldata = json.parseArrayOrEmpty(chunk.getCelldataJson());
         assertEquals(2, celldata.size());
-        assertEquals(0, celldata.getJSONObject(0).getIntValue("r"));
-        assertEquals(0, celldata.getJSONObject(0).getIntValue("c"));
-        assertEquals(1, celldata.getJSONObject(1).getIntValue("r"));
-        assertEquals(1, celldata.getJSONObject(1).getIntValue("c"));
+        assertEquals(0, json.getInt(json.getObjectNode(celldata, 0), "r"));
+        assertEquals(0, json.getInt(json.getObjectNode(celldata, 0), "c"));
+        assertEquals(1, json.getInt(json.getObjectNode(celldata, 1), "r"));
+        assertEquals(1, json.getInt(json.getObjectNode(celldata, 1), "c"));
 
         verify(documentService).updateSheetMeta(7L, 1, "[\"Budget\"]");
     }

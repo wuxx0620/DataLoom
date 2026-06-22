@@ -1,13 +1,22 @@
 package com.demo.excel.service;
 
-import com.alibaba.fastjson.JSONArray;
-import com.alibaba.fastjson.JSONObject;
+import com.demo.excel.common.JsonHelper;
 import com.demo.excel.entity.ExcelDocument;
 import com.demo.excel.entity.ExcelSheet;
 import com.demo.excel.entity.ExcelSheetChunk;
 import com.demo.excel.mapper.ExcelSheetChunkMapper;
 import com.demo.excel.mapper.ExcelSheetMapper;
-import org.apache.poi.ss.usermodel.*;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import org.apache.poi.ss.usermodel.Cell;
+import org.apache.poi.ss.usermodel.CellType;
+import org.apache.poi.ss.usermodel.CellValue;
+import org.apache.poi.ss.usermodel.DateUtil;
+import org.apache.poi.ss.usermodel.FormulaEvaluator;
+import org.apache.poi.ss.usermodel.Row;
+import org.apache.poi.ss.usermodel.Sheet;
+import org.apache.poi.ss.usermodel.Workbook;
+import org.apache.poi.ss.usermodel.WorkbookFactory;
 import org.apache.poi.ss.util.CellRangeAddress;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -24,16 +33,6 @@ import java.util.Map;
 
 /**
  * Excel 解析引擎 — 流式 POI 解析 + 分块持久化
- * <p>
- * 核心设计：
- * <ul>
- * <li>使用 Apache POI {@link WorkbookFactory} 逐行读取，避免整体加载入内存</li>
- * <li>按 {@code CHUNK_SIZE} 行为单位，将 celldata JSON 分块写入 excel_sheet_chunk 表</li>
- * <li>合并单元格、列宽等小型配置存入 excel_sheet 表，不参与分块</li>
- * <li>上层调用方无需关心分块细节，只传入 documentId 即可</li>
- * </ul>
- *
- * @author demo
  */
 @Service
 public class ExcelParserService {
@@ -49,20 +48,9 @@ public class ExcelParserService {
     @Autowired
     private ExcelSheetChunkMapper chunkMapper;
 
-    /**
-     * 解析 Excel 文件并持久化到数据库（分块存储）
-     * <p>
-     * 执行流程：
-     * <ol>
-     * <li>遍历所有 Sheet</li>
-     * <li>每个 Sheet 插入一条 excel_sheet 记录（存元信息 + 配置）</li>
-     * <li>按 CHUNK_SIZE 行批量构建 celldata JSON，逐块写入 excel_sheet_chunk</li>
-     * </ol>
-     *
-     * @param is       Excel 文件输入流（.xlsx 或 .xls）
-     * @param document 已持久化的文档实体（需含有效 ID）
-     * @return 所有 Sheet 的元信息列表（不含 celldata，仅用于给调用方汇总）
-     */
+    @Autowired
+    private JsonHelper json;
+
     @Transactional(rollbackFor = Exception.class)
     public List<ExcelSheet> parseAndSave(InputStream is, ExcelDocument document) throws Exception {
         List<ExcelSheet> savedSheets = new ArrayList<>();
@@ -86,13 +74,6 @@ public class ExcelParserService {
         return savedSheets;
     }
 
-    // =========================================================
-    // 内部方法
-    // =========================================================
-
-    /**
-     * 解析并保存一个 Sheet 的元信息（合并单元格、列宽等）
-     */
     private ExcelSheet saveSheetMeta(Sheet sheet, ExcelDocument document, int sheetIndex, int totalSheets) {
         ExcelSheet sheetEntity = new ExcelSheet();
         sheetEntity.setDocumentId(document.getId());
@@ -101,30 +82,26 @@ public class ExcelParserService {
         sheetEntity.setActive(sheetIndex == 0 ? 1 : 0);
         sheetEntity.setStatus(1);
 
-        // 统计行列数
         int maxRow = sheet.getLastRowNum();
         int maxCol = calcMaxCol(sheet);
         sheetEntity.setTotalRows(maxRow + 1);
         sheetEntity.setTotalCols(maxCol);
 
-        // 合并单元格配置（通常很小，直接 JSON 存这里）
-        JSONObject mergeConfig = buildMergeConfig(sheet);
-        sheetEntity.setMergeConfigJson(mergeConfig.toJSONString());
+        ObjectNode mergeConfig = buildMergeConfig(sheet);
+        sheetEntity.setMergeConfigJson(json.toJson(mergeConfig));
 
-        // 列宽配置
-        JSONObject columnLen = buildColumnLen(sheet, maxCol);
-        sheetEntity.setColumnLenJson(columnLen.toJSONString());
+        ObjectNode columnLen = buildColumnLen(sheet, maxCol);
+        sheetEntity.setColumnLenJson(json.toJson(columnLen));
 
-        JSONObject rowLen = buildRowLen(sheet);
-        sheetEntity.setRowLenJson(rowLen.toJSONString());
+        ObjectNode rowLen = buildRowLen(sheet);
+        sheetEntity.setRowLenJson(json.toJson(rowLen));
 
-        JSONObject config = new JSONObject();
-        config.put("merge", mergeConfig);
-        config.put("columnlen", columnLen);
-        config.put("rowlen", rowLen);
-        sheetEntity.setConfigJson(config.toJSONString());
+        ObjectNode config = json.createObject();
+        config.set("merge", mergeConfig);
+        config.set("columnlen", columnLen);
+        config.set("rowlen", rowLen);
+        sheetEntity.setConfigJson(json.toJson(config));
 
-        // chunkCount 先设 0，等分块写入后再更新
         sheetEntity.setChunkCount(0);
 
         sheetMapper.insert(sheetEntity);
@@ -132,48 +109,40 @@ public class ExcelParserService {
         return sheetEntity;
     }
 
-    /**
-     * 将一个 Sheet 的所有单元格数据按 CHUNK_SIZE 行分块，批量写入数据库
-     * <p>
-     * 分块策略：chunkIndex = rowIdx / CHUNK_SIZE，由行号直接决定块归属。
-     * 这样保证与 batchUpdateCells 中 r / CHUNK_SIZE 的定位逻辑完全一致，
-     * 即使存在空行也不会导致分块边界偏移。
-     */
     private void saveSheetChunks(Sheet sheet, Workbook workbook, ExcelSheet sheetEntity) {
         FormulaEvaluator evaluator = workbook.getCreationHelper().createFormulaEvaluator();
         int lastRowNum = sheet.getLastRowNum();
 
-        // 按 chunkIndex 分组收集单元格数据
-        Map<Integer, List<JSONObject>> chunkBuffer = new LinkedHashMap<>();
+        Map<Integer, List<ObjectNode>> chunkBuffer = new LinkedHashMap<>();
 
         for (int rowIdx = 0; rowIdx <= lastRowNum; rowIdx++) {
             Row row = sheet.getRow(rowIdx);
-            if (row == null)
+            if (row == null) {
                 continue;
+            }
 
-            // chunkIndex 由行号直接决定，与 batchUpdateCells 的 r / CHUNK_SIZE 一致
             int chunkIndex = rowIdx / CHUNK_SIZE;
-            List<JSONObject> buffer = chunkBuffer.computeIfAbsent(chunkIndex, k -> new ArrayList<>(CHUNK_SIZE * 10));
+            List<ObjectNode> buffer = chunkBuffer.computeIfAbsent(chunkIndex, k -> new ArrayList<>(CHUNK_SIZE * 10));
 
             for (Cell cell : row) {
-                JSONObject vObj = buildCellValue(cell, evaluator);
+                ObjectNode vObj = buildCellValue(cell, evaluator);
                 if (vObj != null) {
-                    JSONObject cellItem = new JSONObject();
+                    ObjectNode cellItem = json.createObject();
                     cellItem.put("r", cell.getRowIndex());
                     cellItem.put("c", cell.getColumnIndex());
-                    cellItem.put("v", vObj);
+                    cellItem.set("v", vObj);
                     buffer.add(cellItem);
                 }
             }
         }
 
-        // 逐块写入数据库
         int chunkCount = 0;
-        for (Map.Entry<Integer, List<JSONObject>> entry : chunkBuffer.entrySet()) {
+        for (Map.Entry<Integer, List<ObjectNode>> entry : chunkBuffer.entrySet()) {
             int chunkIndex = entry.getKey();
-            List<JSONObject> cells = entry.getValue();
-            if (cells.isEmpty())
+            List<ObjectNode> cells = entry.getValue();
+            if (cells.isEmpty()) {
                 continue;
+            }
 
             ExcelSheetChunk chunk = new ExcelSheetChunk();
             chunk.setDocumentId(sheetEntity.getDocumentId());
@@ -181,7 +150,7 @@ public class ExcelParserService {
             chunk.setChunkIndex(chunkIndex);
             chunk.setRowStart(chunkIndex * CHUNK_SIZE);
             chunk.setRowEnd((chunkIndex + 1) * CHUNK_SIZE - 1);
-            chunk.setCelldataJson(JSONArray.toJSONString(cells));
+            chunk.setCelldataJson(json.toJson(cells));
             chunkMapper.insert(chunk);
 
             log.debug("    Chunk[{}] 已写入: rows {}-{}, cellCount={}", chunkIndex, chunk.getRowStart(), chunk.getRowEnd(),
@@ -189,7 +158,6 @@ public class ExcelParserService {
             chunkCount = chunkIndex + 1;
         }
 
-        // 更新 chunkCount
         ExcelSheet update = new ExcelSheet();
         update.setId(sheetEntity.getId());
         update.setChunkCount(chunkCount);
@@ -199,19 +167,17 @@ public class ExcelParserService {
         log.info("    Sheet [{}] 分块完成，共 {} 块", sheetEntity.getSheetName(), chunkCount);
     }
 
-    /**
-     * 根据单元格类型构建 Luckysheet 的 v 对象
-     */
-    private JSONObject buildCellValue(Cell cell, FormulaEvaluator evaluator) {
-        JSONObject v = new JSONObject();
-        JSONObject ct = new JSONObject();
+    private ObjectNode buildCellValue(Cell cell, FormulaEvaluator evaluator) {
+        ObjectNode v = json.createObject();
+        ObjectNode ct = json.createObject();
 
         try {
             switch (cell.getCellType()) {
                 case STRING: {
                     String val = cell.getStringCellValue();
-                    if (val == null || val.isEmpty())
+                    if (val == null || val.isEmpty()) {
                         return null;
+                    }
                     v.put("v", val);
                     v.put("m", val);
                     ct.put("fa", "General");
@@ -258,7 +224,6 @@ public class ExcelParserService {
                         ct.put("fa", "General");
                         ct.put("t", "n");
                     } catch (Exception fe) {
-                        // 公式计算失败时降级为字符串
                         String raw = cell.getCellFormula();
                         v.put("v", "=" + raw);
                         v.put("m", "=" + raw);
@@ -272,17 +237,13 @@ public class ExcelParserService {
                     return null;
             }
         } catch (Exception e) {
-            // 单个单元格解析异常时跳过，不中断整体解析
             return null;
         }
 
-        v.put("ct", ct);
+        v.set("ct", ct);
         return v;
     }
 
-    /**
-     * 计算 Sheet 的最大列数
-     */
     private int calcMaxCol(Sheet sheet) {
         int max = 0;
         for (Row row : sheet) {
@@ -293,28 +254,22 @@ public class ExcelParserService {
         return max;
     }
 
-    /**
-     * 构建合并单元格配置 JSON（Luckysheet merge 格式）
-     */
-    private JSONObject buildMergeConfig(Sheet sheet) {
-        JSONObject mergeConfig = new JSONObject();
+    private ObjectNode buildMergeConfig(Sheet sheet) {
+        ObjectNode mergeConfig = json.createObject();
         for (CellRangeAddress range : sheet.getMergedRegions()) {
             String key = range.getFirstRow() + "_" + range.getFirstColumn();
-            JSONObject item = new JSONObject();
+            ObjectNode item = json.createObject();
             item.put("r", range.getFirstRow());
             item.put("c", range.getFirstColumn());
             item.put("rs", range.getLastRow() - range.getFirstRow() + 1);
             item.put("cs", range.getLastColumn() - range.getFirstColumn() + 1);
-            mergeConfig.put(key, item);
+            mergeConfig.set(key, item);
         }
         return mergeConfig;
     }
 
-    /**
-     * 构建列宽配置 JSON（Luckysheet columnlen 格式）
-     */
-    private JSONObject buildColumnLen(Sheet sheet, int maxCol) {
-        JSONObject colWidths = new JSONObject();
+    private ObjectNode buildColumnLen(Sheet sheet, int maxCol) {
+        ObjectNode colWidths = json.createObject();
         try {
             for (int ci = 0; ci < maxCol; ci++) {
                 double width = sheet.getColumnWidthInPixels(ci);
@@ -326,11 +281,12 @@ public class ExcelParserService {
         return colWidths;
     }
 
-    private JSONObject buildRowLen(Sheet sheet) {
-        JSONObject rowHeights = new JSONObject();
+    private ObjectNode buildRowLen(Sheet sheet) {
+        ObjectNode rowHeights = json.createObject();
         for (Row row : sheet) {
-            if (row == null)
+            if (row == null) {
                 continue;
+            }
             float height = row.getHeightInPoints();
             if (height > 0) {
                 rowHeights.put(String.valueOf(row.getRowNum()), Math.round(height / 0.75f));
@@ -340,8 +296,9 @@ public class ExcelParserService {
     }
 
     private String formatNum(double num) {
-        if (num == (long) num)
+        if (num == (long) num) {
             return String.valueOf((long) num);
+        }
         return String.valueOf(num);
     }
 }

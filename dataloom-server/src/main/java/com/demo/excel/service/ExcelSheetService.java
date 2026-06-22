@@ -1,12 +1,14 @@
 package com.demo.excel.service;
 
-import com.alibaba.fastjson.JSONArray;
-import com.alibaba.fastjson.JSONObject;
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
+import com.demo.excel.common.JsonHelper;
 import com.demo.excel.entity.ExcelSheet;
 import com.demo.excel.entity.ExcelSheetChunk;
 import com.demo.excel.mapper.ExcelSheetChunkMapper;
 import com.demo.excel.mapper.ExcelSheetMapper;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -22,13 +24,6 @@ import java.util.Set;
 
 /**
  * Excel Sheet 及数据分块查询服务
- * <p>
- * 职责：
- * <ul>
- * <li>查询文档下的所有 Sheet 元信息</li>
- * <li>按 Sheet ID 加载全部或指定范围的数据分块</li>
- * <li>删除文档时级联清理 Sheet 和 Chunk 数据</li>
- * </ul>
  */
 @Service
 public class ExcelSheetService {
@@ -42,12 +37,9 @@ public class ExcelSheetService {
     @Autowired
     private ExcelDocumentService documentService;
 
-    /**
-     * 查询文档下的所有 Sheet 元信息列表（按 sheetIndex 升序，不含 celldata）
-     *
-     * @param documentId 文档 ID
-     * @return Sheet 元信息列表
-     */
+    @Autowired
+    private JsonHelper json;
+
     public List<ExcelSheet> listSheetsByDocumentId(Long documentId) {
         QueryWrapper<ExcelSheet> qw = new QueryWrapper<>();
         qw.eq("document_id", documentId)
@@ -56,14 +48,6 @@ public class ExcelSheetService {
         return sheetMapper.selectList(qw);
     }
 
-    /**
-     * 获取指定 Sheet 的所有数据分块（按 chunkIndex 升序）
-     * <p>
-     * 注意：返回的是完整的分块列表，调用方可按需合并 celldataJson 或按块分页加载。
-     *
-     * @param sheetId Sheet ID
-     * @return 分块列表
-     */
     public List<ExcelSheetChunk> listChunksBySheetId(Long sheetId) {
         QueryWrapper<ExcelSheetChunk> qw = new QueryWrapper<>();
         qw.eq("sheet_id", sheetId)
@@ -71,38 +55,20 @@ public class ExcelSheetService {
         return chunkMapper.selectList(qw);
     }
 
-    /**
-     * 删除文档下所有 Sheet 及 Chunk 数据（软删除 Sheet，物理删除 Chunk）
-     *
-     * @param documentId 文档 ID
-     */
     public void deleteByDocumentId(Long documentId) {
-        // 软删除 Sheet
         ExcelSheet update = new ExcelSheet();
         update.setStatus(3);
         QueryWrapper<ExcelSheet> sheetQw = new QueryWrapper<>();
         sheetQw.eq("document_id", documentId);
         sheetMapper.update(update, sheetQw);
 
-        // 物理删除 Chunk（数据量大，不做逻辑删除）
         QueryWrapper<ExcelSheetChunk> chunkQw = new QueryWrapper<>();
         chunkQw.eq("document_id", documentId);
         chunkMapper.delete(chunkQw);
     }
 
-    /**
-     * 批量增量更新单元格 — 按 Chunk 分组后逐块事务写入
-     * <p>
-     * 性能优化：先将所有更新按 (sheetId_chunkIndex) 分组，
-     * 每组只读/写一次对应 Chunk，避免重复 I/O。
-     *
-     *
-     * @param documentId 文档 ID
-     * @param updates    更新列表
-     */
     @Transactional(rollbackFor = Exception.class)
     public void batchUpdateCells(Long documentId, List<Map<String, Object>> updates) {
-        // 为了性能优化，按 chunk 分组，减少数据库 I/O
         Map<String, List<Map<String, Object>>> chunkGroup = new HashMap<>();
         int chunkSize = ExcelParserService.CHUNK_SIZE;
 
@@ -111,10 +77,9 @@ public class ExcelSheetService {
             int r = Integer.parseInt(update.get("r").toString());
             int targetChunkIndex = r / chunkSize;
             String key = sheetId + "_" + targetChunkIndex;
-            chunkGroup.computeIfAbsent(key, k -> new java.util.ArrayList<>()).add(update);
+            chunkGroup.computeIfAbsent(key, k -> new ArrayList<>()).add(update);
         }
 
-        // 按 Chunk 批量处理
         for (Map.Entry<String, List<Map<String, Object>>> entry : chunkGroup.entrySet()) {
             String[] parts = entry.getKey().split("_");
             Long sheetId = Long.parseLong(parts[0]);
@@ -124,7 +89,7 @@ public class ExcelSheetService {
             qw.eq("sheet_id", sheetId).eq("chunk_index", targetChunkIndex);
             ExcelSheetChunk chunk = chunkMapper.selectOne(qw);
 
-            com.alibaba.fastjson.JSONArray cellArray;
+            ArrayNode cellArray;
             boolean isNewChunk = false;
 
             if (chunk == null) {
@@ -135,22 +100,20 @@ public class ExcelSheetService {
                 chunk.setChunkIndex(targetChunkIndex);
                 chunk.setRowStart(targetChunkIndex * chunkSize);
                 chunk.setRowEnd((targetChunkIndex + 1) * chunkSize - 1);
-                cellArray = new com.alibaba.fastjson.JSONArray();
+                cellArray = json.createArray();
             } else {
-                String jsonStr = chunk.getCelldataJson();
-                cellArray = (jsonStr != null && !jsonStr.isEmpty())
-                        ? com.alibaba.fastjson.JSONArray.parseArray(jsonStr)
-                        : new com.alibaba.fastjson.JSONArray();
+                cellArray = json.parseArrayOrEmpty(chunk.getCelldataJson());
             }
 
-            // 构建 "r_c" → 数组下标 的索引，将查找从 O(n) 降为 O(1)
             Map<String, Integer> cellIndex = new HashMap<>(cellArray.size());
             for (int i = 0; i < cellArray.size(); i++) {
-                com.alibaba.fastjson.JSONObject cell = cellArray.getJSONObject(i);
-                cellIndex.put(cell.getIntValue("r") + "_" + cell.getIntValue("c"), i);
+                ObjectNode cell = json.getObjectNode(cellArray, i);
+                if (cell == null) {
+                    continue;
+                }
+                cellIndex.put(json.getInt(cell, "r") + "_" + json.getInt(cell, "c"), i);
             }
 
-            // 待删除的下标集合，延迟到最后一并清理，避免每次删除都重建索引
             Set<Integer> removeSet = new HashSet<>();
 
             for (Map<String, Object> update : entry.getValue()) {
@@ -158,34 +121,26 @@ public class ExcelSheetService {
                 int c = Integer.parseInt(update.get("c").toString());
                 String cellKey = r + "_" + c;
                 Object vObj = update.get("v");
-                com.alibaba.fastjson.JSONObject cellValue = null;
-                if (vObj != null) {
-                    cellValue = com.alibaba.fastjson.JSONObject
-                            .parseObject(com.alibaba.fastjson.JSONObject.toJSONString(vObj));
-                }
+                ObjectNode cellValue = vObj != null ? json.toObjectNode(vObj) : null;
 
                 Integer idx = cellIndex.get(cellKey);
                 if (idx != null) {
-                    if (cellValue == null || cellValue.isEmpty()) {
-                        // 标记删除，不立即从数组移除（避免索引错位）
-                        removeSet.add(idx.intValue());
+                    if (json.isEmptyObject(cellValue)) {
+                        removeSet.add(idx);
                         cellIndex.remove(cellKey);
                     } else {
-                        // 原地更新，不影响索引
-                        cellArray.getJSONObject(idx.intValue()).put("v", cellValue);
+                        json.getObjectNode(cellArray, idx).set("v", cellValue);
                     }
-                } else if (cellValue != null && !cellValue.isEmpty()) {
-                    // 新增单元格，追加到末尾
-                    com.alibaba.fastjson.JSONObject newCell = new com.alibaba.fastjson.JSONObject();
+                } else if (!json.isEmptyObject(cellValue)) {
+                    ObjectNode newCell = json.createObject();
                     newCell.put("r", r);
                     newCell.put("c", c);
-                    newCell.put("v", cellValue);
+                    newCell.set("v", cellValue);
                     cellArray.add(newCell);
                     cellIndex.put(cellKey, cellArray.size() - 1);
                 }
             }
 
-            // 统一清理：倒序移除标记的单元格，倒序保证下标不会错位
             if (!removeSet.isEmpty()) {
                 List<Integer> sortedIndices = new ArrayList<>(removeSet);
                 sortedIndices.sort(Collections.reverseOrder());
@@ -194,7 +149,7 @@ public class ExcelSheetService {
                 }
             }
 
-            chunk.setCelldataJson(cellArray.toJSONString());
+            chunk.setCelldataJson(json.toJson(cellArray));
 
             if (isNewChunk) {
                 chunkMapper.insert(chunk);
@@ -211,13 +166,6 @@ public class ExcelSheetService {
         }
     }
 
-    /**
-     * 全量替换工作簿 — 删除旧 Sheet/Chunk 后逐 Sheet 重建（事务保护）
-     * <p>
-     * 流程：物理删除所有 Chunk → 软删除所有 Sheet →
-     * 逐 Sheet 插入新记录 + 保存 celldata → 更新文档 sheet 元信息。
-     * 返回 {@code sheetIndex → 新SheetId} 映射，供前端后续增量保存。
-     */
     @Transactional(rollbackFor = Exception.class)
     public Map<Integer, Long> replaceWorkbook(Long documentId, List<Map<String, Object>> workbookSheets) {
         if (workbookSheets == null || workbookSheets.isEmpty()) {
@@ -239,41 +187,49 @@ public class ExcelSheetService {
         Map<Integer, Long> sheetIdMapping = new LinkedHashMap<>();
 
         for (Map<String, Object> rawSheet : workbookSheets) {
-            if (rawSheet == null) continue;
+            if (rawSheet == null) {
+                continue;
+            }
 
             String name = stringValue(rawSheet.get("name"), "Sheet" + (visibleIndex + 1));
             sheetNames.add(name);
 
-            JSONObject config = toJsonObject(rawSheet.get("config"));
-            JSONObject hyperlink = toJsonObject(rawSheet.get("hyperlink"));
-            if (hyperlink == null) {
-                hyperlink = new JSONObject();
+            ObjectNode config = toJsonObject(rawSheet.get("config"));
+            ObjectNode hyperlink = toJsonObject(rawSheet.get("hyperlink"));
+            if (json.isEmptyObject(hyperlink)) {
+                hyperlink = json.createObject();
             }
-            JSONObject images = toJsonObject(rawSheet.get("images"));
-            if (images == null) {
-                images = new JSONObject();
+            ObjectNode images = toJsonObject(rawSheet.get("images"));
+            if (json.isEmptyObject(images)) {
+                images = json.createObject();
             }
-            JSONArray conditionFormat = toJsonArray(rawSheet.get("luckysheet_conditionformat_save"));
-            if (conditionFormat == null) {
-                conditionFormat = new JSONArray();
+            ArrayNode conditionFormat = toJsonArray(rawSheet.get("luckysheet_conditionformat_save"));
+            if (conditionFormat.isEmpty()) {
+                conditionFormat = json.createArray();
             }
-            JSONArray chart = toJsonArray(rawSheet.get("chart"));
-            if (chart == null) {
-                chart = new JSONArray();
+            ArrayNode chart = toJsonArray(rawSheet.get("chart"));
+            if (chart.isEmpty()) {
+                chart = json.createArray();
             }
 
-            JSONObject merge = config.getJSONObject("merge");
-            JSONObject columnLen = config.getJSONObject("columnlen");
-            JSONObject rowLen = config.getJSONObject("rowlen");
+            ObjectNode merge = json.getObjectNode(config, "merge");
+            ObjectNode columnLen = json.getObjectNode(config, "columnlen");
+            ObjectNode rowLen = json.getObjectNode(config, "rowlen");
 
-            if (merge == null) merge = new JSONObject();
-            if (columnLen == null) columnLen = new JSONObject();
-            if (rowLen == null) rowLen = new JSONObject();
-            config.put("merge", merge);
-            config.put("columnlen", columnLen);
-            config.put("rowlen", rowLen);
+            if (merge == null) {
+                merge = json.createObject();
+            }
+            if (columnLen == null) {
+                columnLen = json.createObject();
+            }
+            if (rowLen == null) {
+                rowLen = json.createObject();
+            }
+            config.set("merge", merge);
+            config.set("columnlen", columnLen);
+            config.set("rowlen", rowLen);
 
-            JSONArray celldata = resolveCelldata(rawSheet);
+            ArrayNode celldata = resolveCelldata(rawSheet);
             int totalRows = intValue(rawSheet.get("row"), calcTotalRows(rawSheet.get("data"), celldata));
             int totalCols = intValue(rawSheet.get("column"), calcTotalCols(rawSheet.get("data"), celldata));
 
@@ -284,14 +240,14 @@ public class ExcelSheetService {
             sheet.setTotalRows(Math.max(totalRows, 1));
             sheet.setTotalCols(Math.max(totalCols, 1));
             sheet.setChunkCount(0);
-            sheet.setMergeConfigJson(merge.toJSONString());
-            sheet.setColumnLenJson(columnLen.toJSONString());
-            sheet.setRowLenJson(rowLen.toJSONString());
-            sheet.setConfigJson(config.toJSONString());
-            sheet.setHyperlinkConfigJson(hyperlink.toJSONString());
-            sheet.setImagesConfigJson(images.toJSONString());
-            sheet.setConditionFormatJson(conditionFormat.toJSONString());
-            sheet.setChartJson(chart.toJSONString());
+            sheet.setMergeConfigJson(json.toJson(merge));
+            sheet.setColumnLenJson(json.toJson(columnLen));
+            sheet.setRowLenJson(json.toJson(rowLen));
+            sheet.setConfigJson(json.toJson(config));
+            sheet.setHyperlinkConfigJson(json.toJson(hyperlink));
+            sheet.setImagesConfigJson(json.toJson(images));
+            sheet.setConditionFormatJson(json.toJson(conditionFormat));
+            sheet.setChartJson(json.toJson(chart));
             sheet.setActive(intValue(rawSheet.get("status"), visibleIndex == 0 ? 1 : 0));
             sheet.setStatus(1);
             sheetMapper.insert(sheet);
@@ -311,26 +267,29 @@ public class ExcelSheetService {
             throw new IllegalArgumentException("workbook contains no valid sheets");
         }
 
-        documentService.updateSheetMeta(documentId, sheetNames.size(), JSONArray.toJSONString(sheetNames));
+        documentService.updateSheetMeta(documentId, sheetNames.size(), json.toJson(sheetNames));
         return sheetIdMapping;
     }
 
-    private int saveCelldataChunks(Long documentId, Long sheetId, JSONArray celldata, int totalRows) {
-        Map<Integer, JSONArray> chunks = new LinkedHashMap<>();
+    private int saveCelldataChunks(Long documentId, Long sheetId, ArrayNode celldata, int totalRows) {
+        Map<Integer, ArrayNode> chunks = new LinkedHashMap<>();
         int chunkSize = ExcelParserService.CHUNK_SIZE;
 
         for (int i = 0; i < celldata.size(); i++) {
-            JSONObject cell = celldata.getJSONObject(i);
-            int row = cell.getIntValue("r");
+            ObjectNode cell = json.getObjectNode(celldata, i);
+            if (cell == null) {
+                continue;
+            }
+            int row = json.getInt(cell, "r");
             int chunkIndex = row / chunkSize;
-            chunks.computeIfAbsent(chunkIndex, key -> new JSONArray()).add(cell);
+            chunks.computeIfAbsent(chunkIndex, key -> json.createArray()).add(cell);
         }
 
         if (chunks.isEmpty()) {
             return Math.max(1, (int) Math.ceil(Math.max(totalRows, 1) / (double) chunkSize));
         }
 
-        for (Map.Entry<Integer, JSONArray> entry : chunks.entrySet()) {
+        for (Map.Entry<Integer, ArrayNode> entry : chunks.entrySet()) {
             int chunkIndex = entry.getKey();
             ExcelSheetChunk chunk = new ExcelSheetChunk();
             chunk.setDocumentId(documentId);
@@ -338,95 +297,129 @@ public class ExcelSheetService {
             chunk.setChunkIndex(chunkIndex);
             chunk.setRowStart(chunkIndex * chunkSize);
             chunk.setRowEnd((chunkIndex + 1) * chunkSize - 1);
-            chunk.setCelldataJson(entry.getValue().toJSONString());
+            chunk.setCelldataJson(json.toJson(entry.getValue()));
             chunkMapper.insert(chunk);
         }
 
         return chunks.keySet().stream().max(Integer::compareTo).orElse(0) + 1;
     }
 
-    private JSONArray resolveCelldata(Map<String, Object> rawSheet) {
-        Object celldataObj = rawSheet.get("celldata");
-        JSONArray celldata = toJsonArray(celldataObj);
-        if (!celldata.isEmpty()) return normalizeCelldata(celldata);
-
+    private ArrayNode resolveCelldata(Map<String, Object> rawSheet) {
+        ArrayNode celldata = toJsonArray(rawSheet.get("celldata"));
+        if (!celldata.isEmpty()) {
+            return normalizeCelldata(celldata);
+        }
         return dataMatrixToCelldata(rawSheet.get("data"));
     }
 
-    private JSONArray normalizeCelldata(JSONArray celldata) {
-        JSONArray normalized = new JSONArray();
+    private ArrayNode normalizeCelldata(ArrayNode celldata) {
+        ArrayNode normalized = json.createArray();
         for (int i = 0; i < celldata.size(); i++) {
-            JSONObject cell = celldata.getJSONObject(i);
-            if (cell == null || !cell.containsKey("r") || !cell.containsKey("c")) continue;
-            Object value = cell.get("v");
-            if (isEmptyCellValue(value)) continue;
+            ObjectNode cell = json.getObjectNode(celldata, i);
+            if (cell == null || !cell.has("r") || !cell.has("c")) {
+                continue;
+            }
+            JsonNode value = cell.get("v");
+            if (isEmptyCellValue(value)) {
+                continue;
+            }
             normalized.add(cell);
         }
         return normalized;
     }
 
-    private JSONArray dataMatrixToCelldata(Object dataObj) {
-        JSONArray rows = toJsonArray(dataObj);
-        JSONArray celldata = new JSONArray();
+    private ArrayNode dataMatrixToCelldata(Object dataObj) {
+        ArrayNode rows = toJsonArray(dataObj);
+        ArrayNode celldata = json.createArray();
 
         for (int r = 0; r < rows.size(); r++) {
-            JSONArray row = toJsonArray(rows.get(r));
+            ArrayNode row = json.getArrayNode(rows, r);
+            if (row == null) {
+                continue;
+            }
             for (int c = 0; c < row.size(); c++) {
-                Object value = row.get(c);
-                if (isEmptyCellValue(value)) continue;
+                JsonNode value = row.get(c);
+                if (isEmptyCellValue(value)) {
+                    continue;
+                }
 
-                JSONObject cell = new JSONObject();
+                ObjectNode cell = json.createObject();
                 cell.put("r", r);
                 cell.put("c", c);
-                cell.put("v", toJsonObject(value));
+                cell.set("v", toJsonObject(value));
                 celldata.add(cell);
             }
         }
         return celldata;
     }
 
-    private boolean isEmptyCellValue(Object value) {
-        if (value == null) return true;
-        if (value instanceof JSONObject) return ((JSONObject) value).isEmpty();
-        if (value instanceof Map) return ((Map<?, ?>) value).isEmpty();
+    private boolean isEmptyCellValue(JsonNode value) {
+        if (value == null || value.isNull()) {
+            return true;
+        }
+        if (value.isObject()) {
+            return value.isEmpty();
+        }
         return false;
     }
 
-    private int calcTotalRows(Object dataObj, JSONArray celldata) {
-        JSONArray rows = toJsonArray(dataObj);
+    private int calcTotalRows(Object dataObj, ArrayNode celldata) {
+        ArrayNode rows = toJsonArray(dataObj);
         int max = rows.size();
         for (int i = 0; i < celldata.size(); i++) {
-            max = Math.max(max, celldata.getJSONObject(i).getIntValue("r") + 1);
+            ObjectNode cell = json.getObjectNode(celldata, i);
+            if (cell != null) {
+                max = Math.max(max, json.getInt(cell, "r") + 1);
+            }
         }
         return max;
     }
 
-    private int calcTotalCols(Object dataObj, JSONArray celldata) {
-        JSONArray rows = toJsonArray(dataObj);
+    private int calcTotalCols(Object dataObj, ArrayNode celldata) {
+        ArrayNode rows = toJsonArray(dataObj);
         int max = 0;
         for (int r = 0; r < rows.size(); r++) {
-            max = Math.max(max, toJsonArray(rows.get(r)).size());
+            ArrayNode row = json.getArrayNode(rows, r);
+            if (row != null) {
+                max = Math.max(max, row.size());
+            }
         }
         for (int i = 0; i < celldata.size(); i++) {
-            max = Math.max(max, celldata.getJSONObject(i).getIntValue("c") + 1);
+            ObjectNode cell = json.getObjectNode(celldata, i);
+            if (cell != null) {
+                max = Math.max(max, json.getInt(cell, "c") + 1);
+            }
         }
         return max;
     }
 
-    private JSONObject toJsonObject(Object value) {
-        if (value == null) return new JSONObject();
-        if (value instanceof JSONObject) return (JSONObject) value;
-        return JSONObject.parseObject(JSONObject.toJSONString(value));
+    private ObjectNode toJsonObject(Object value) {
+        if (value == null) {
+            return json.createObject();
+        }
+        if (value instanceof ObjectNode objectNode) {
+            return objectNode;
+        }
+        if (value instanceof JsonNode jsonNode && jsonNode.isObject()) {
+            return (ObjectNode) jsonNode;
+        }
+        return json.toObjectNode(value);
     }
 
-    private JSONArray toJsonArray(Object value) {
-        if (value == null) return new JSONArray();
-        if (value instanceof JSONArray) return (JSONArray) value;
-        return JSONArray.parseArray(JSONArray.toJSONString(value));
+    private ArrayNode toJsonArray(Object value) {
+        if (value == null) {
+            return json.createArray();
+        }
+        if (value instanceof ArrayNode arrayNode) {
+            return arrayNode;
+        }
+        return json.toArrayNode(value);
     }
 
     private int intValue(Object value, int defaultValue) {
-        if (value == null) return defaultValue;
+        if (value == null) {
+            return defaultValue;
+        }
         try {
             return Integer.parseInt(value.toString());
         } catch (Exception ignored) {
@@ -435,7 +428,9 @@ public class ExcelSheetService {
     }
 
     private String stringValue(Object value, String defaultValue) {
-        if (value == null) return defaultValue;
+        if (value == null) {
+            return defaultValue;
+        }
         String text = value.toString();
         return text.trim().isEmpty() ? defaultValue : text;
     }

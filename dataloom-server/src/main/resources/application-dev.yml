@@ -2,7 +2,7 @@
 spring:
   datasource:
     driver-class-name: org.h2.Driver
-    url: jdbc:h2:file:./data/excel-demo;DB_CLOSE_DELAY=-1;MODE=MySQL
+    url: jdbc:h2:file:./data/excel-demo;DB_CLOSE_DELAY=-1;MODE=MySQL;AUTO_SERVER=TRUE
     username: sa
     password:
 
