@@ -35,6 +35,13 @@ logs/
 .vscode/
 *.iml
 
+# Eclipse / Java 扩展自动生成的项目元数据（无需提交）
+.classpath
+.project
+.factorypath
+.settings/
+bin/
+
 # OS files
 .DS_Store
 Thumbs.db
